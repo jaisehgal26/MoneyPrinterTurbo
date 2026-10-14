@@ -45,6 +45,7 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import bgm as bgm_service
+from app.services import excel_batch
 from app.services import material_upload as material_upload_service
 from app.services import (
     cache_manager,
@@ -7935,6 +7936,166 @@ def _stage_task_audio(audio_path, audio_bytes):
                 logger.warning(f"failed to remove staged task audio: {exc}")
 
 
+def _render_excel_folder_selector() -> str:
+    """Click through folders and use the open folder as the save location."""
+    roots = excel_batch.allowed_output_roots()
+    root_paths = [root for _, root in roots]
+    default_folder = Path(utils.storage_dir("excel_videos", create=True))
+    if "excel_browse_path" not in st.session_state:
+        st.session_state["excel_browse_path"] = str(default_folder)
+
+    current = Path(st.session_state["excel_browse_path"])
+    if not current.is_dir() or not excel_batch.folder_is_allowed(current, root_paths):
+        current = default_folder
+        st.session_state["excel_browse_path"] = str(current)
+
+    st.markdown("**Output folder**")
+    shortcut_columns = st.columns(len(roots))
+    for column, (label, root) in zip(shortcut_columns, roots):
+        if column.button(label, key=f"excel_root_{label}", use_container_width=True):
+            st.session_state["excel_browse_path"] = str(root)
+            st.rerun()
+
+    st.code(excel_batch.display_folder(current), language=None)
+    parent = current.parent
+    if st.button(
+        "Up",
+        key="excel_folder_up",
+        disabled=not excel_batch.folder_is_allowed(parent, root_paths) or parent == current,
+    ):
+        st.session_state["excel_browse_path"] = str(parent)
+        st.rerun()
+
+    try:
+        children = excel_batch.list_child_folders(current)
+    except OSError as exc:
+        st.warning(f"Could not open this folder: {exc}")
+        children = []
+    shown = children[:100]
+    for child in shown:
+        child_key = hashlib.sha1(str(child).encode("utf-8")).hexdigest()[:12]
+        if st.button(child.name, key=f"excel_open_{child_key}", use_container_width=True):
+            st.session_state["excel_browse_path"] = str(child)
+            st.rerun()
+    if len(children) > len(shown):
+        st.caption(f"Showing {len(shown)} of {len(children)} folders.")
+
+    new_folder_name = st.text_input("New folder in the current location", key="excel_new_folder_name")
+    if st.button("Create folder", key="excel_create_folder") and new_folder_name.strip():
+        try:
+            created = current / excel_batch.safe_child_folder_name(new_folder_name)
+            created.mkdir(parents=False, exist_ok=True)
+        except (OSError, ValueError) as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["excel_browse_path"] = str(created)
+            st.rerun()
+
+    st.caption(f"Selected: {excel_batch.display_folder(current)}")
+    return str(current)
+
+
+def _render_excel_batch(params):
+    """Upload a spreadsheet and save one video per row, named by Video ID."""
+    st.subheader("Generate from Excel")
+    st.caption(
+        "Upload an .xlsx file with a Video ID column and a Subject column. "
+        "Each row becomes one video, using the voice, subtitles, and video source "
+        "selected on this page. Files are saved as the Video ID, for example MD-001.mp4."
+    )
+    uploaded_sheet = st.file_uploader(
+        "Excel file",
+        type=["xlsx"],
+        key="excel_batch_file",
+        help="The first worksheet must contain Video ID and Subject columns.",
+    )
+    output_folder = _render_excel_folder_selector()
+
+    skip_existing = st.checkbox(
+        "Skip a Video ID when that file already exists",
+        value=True,
+        key="excel_batch_skip_existing",
+    )
+    rows = []
+    if uploaded_sheet is not None:
+        try:
+            rows = excel_batch.parse_excel_rows(uploaded_sheet.getvalue())
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.caption(f"{len(rows)} videos found.")
+            st.table(
+                [
+                    {
+                        "Video ID": row.video_id,
+                        "Subject": row.subject[:120],
+                        "Search terms": "; ".join(row.search_terms[:4]),
+                    }
+                    for row in rows[:8]
+                ]
+            )
+            if len(rows) > 8:
+                st.caption(f"Showing 8 of {len(rows)} rows.")
+
+    button_cols = st.columns(2)
+    if button_cols[0].button(
+        "Generate videos from Excel",
+        type="primary",
+        use_container_width=True,
+        disabled=not rows or excel_batch.batch_is_running(),
+        key="excel_batch_start",
+    ):
+        try:
+            destination = excel_batch.resolve_output_dir(output_folder)
+            excel_batch.start_batch(
+                rows,
+                destination,
+                params,
+                skip_existing=skip_existing,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            st.error(str(exc))
+        else:
+            st.success(f"Started {len(rows)} videos. Saving into {destination}.")
+    if button_cols[1].button(
+        "Stop after current video",
+        use_container_width=True,
+        disabled=not excel_batch.batch_is_running(),
+        key="excel_batch_stop",
+    ):
+        excel_batch.request_stop()
+        st.info("The current video will finish, then the batch will stop.")
+    _render_excel_batch_status()
+
+
+@st.fragment(run_every="2s")
+def _render_excel_batch_status():
+    status = excel_batch.read_status()
+    if not status:
+        return
+    total = int(status.get("total") or 0)
+    finished = int(status.get("finished") or 0)
+    current = status.get("current") or ""
+    message = status.get("message") or ""
+    if status.get("running"):
+        label = f"Generating {finished} of {total}"
+        if current:
+            label = f"{label}: {current}"
+        st.info(label)
+    elif message:
+        st.caption(message)
+    saved = [
+        item for item in status.get("items", []) if item.get("status") == "saved"
+    ]
+    failed = [
+        item for item in status.get("items", []) if item.get("status") == "failed"
+    ]
+    if saved:
+        st.caption(f"Saved {len(saved)} video(s) in {status.get('output_dir', '')}.")
+    for item in failed[:5]:
+        st.error(f"{item.get('video_id')}: {item.get('error')}")
+
+
 def _render_generation_controls(
     params, uploaded_files, uploaded_audio_file, uploaded_bgm_file, voice_mode
 ):
@@ -7945,6 +8106,7 @@ def _render_generation_controls(
     据此跳过页面末尾的重复请求。主脚本必须及时结束，定时 Fragment 才能持续
     刷新进度和任务日志。
     """
+    _render_excel_batch(params)
     restore_upload_requirements = st.session_state.get(
         "task_restore_upload_requirements", {}
     )

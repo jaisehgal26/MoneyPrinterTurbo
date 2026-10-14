@@ -1,6 +1,8 @@
 x-common-volumes: &common-volumes
   - ./config.toml:/MoneyPrinterTurbo/config.toml
   - ./storage:/MoneyPrinterTurbo/storage
+  - ./webui/Main.py:/MoneyPrinterTurbo/webui/Main.py
+  - ./app/services/excel_batch.py:/MoneyPrinterTurbo/app/services/excel_batch.py
 
 services:
   webui:
@@ -9,7 +11,16 @@ services:
     ports:
       - "127.0.0.1:8501:8501"
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
-    volumes: *common-volumes
+    environment:
+      EXCEL_HOST_FOLDER_ROOT: /host/Users/sehga
+      EXCEL_HOST_FOLDER_LABEL: C:\Users\sehga
+      EXCEL_STORAGE_LABEL: C:\Users\sehga\OneDrive\Documents\GitHub\MoneyPrinterTurbo\storage
+    volumes:
+      - ./config.toml:/MoneyPrinterTurbo/config.toml
+      - ./storage:/MoneyPrinterTurbo/storage
+      - ./webui/Main.py:/MoneyPrinterTurbo/webui/Main.py
+      - ./app/services/excel_batch.py:/MoneyPrinterTurbo/app/services/excel_batch.py
+      - C:/Users/sehga:/host/Users/sehga
     restart: always
   api:
     image: ghcr.io/harry0703/moneyprinterturbo:latest
