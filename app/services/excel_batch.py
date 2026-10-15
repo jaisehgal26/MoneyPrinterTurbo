@@ -1,5 +1,7 @@
 """Turn a spreadsheet of subjects into one named video per row."""
 
+from __future__ import annotations
+
 import io
 import json
 import os
@@ -7,6 +9,7 @@ import re
 import shutil
 import threading
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -28,6 +31,13 @@ _SAFE_VIDEO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}")
 _batch_lock = threading.Lock()
 _batch_thread: threading.Thread | None = None
 _stop_requested = threading.Event()
+_queue: deque[tuple[int, ExcelVideoRow]] = deque()
+_status_items: list[dict] = []
+_status_finished = 0
+_status_output_dirs: list[str] = []
+_status_params: VideoParams | None = None
+_status_skip_existing = True
+_status_current = ""
 
 
 @dataclass(frozen=True)
@@ -35,6 +45,8 @@ class ExcelVideoRow:
     video_id: str
     subject: str
     search_terms: list[str]
+    source_name: str = ""
+    output_dir: str = ""
 
 
 def parse_excel_rows(file_bytes: bytes) -> list[ExcelVideoRow]:
@@ -75,6 +87,57 @@ def parse_excel_rows(file_bytes: bytes) -> list[ExcelVideoRow]:
     if not rows:
         raise ValueError("The spreadsheet has headers but no video rows.")
     return rows
+
+
+def workbook_output_dirs(
+    selected: Path,
+    filenames: list[str],
+    separate: bool,
+    reserved: list[str] | None = None,
+) -> list[Path]:
+    """Put each spreadsheet in its own folder when more than one is running."""
+    if not separate:
+        return [selected for _ in filenames]
+    used = {name.casefold() for name in (reserved or []) if name}
+    folders: list[Path] = []
+    for filename in filenames:
+        stem = Path(filename).stem.strip() or "spreadsheet"
+        try:
+            safe_stem = safe_child_folder_name(stem)
+        except ValueError:
+            safe_stem = "spreadsheet"
+        candidate = safe_stem
+        suffix = 2
+        while candidate.casefold() in used:
+            candidate = f"{safe_stem}-{suffix}"
+            suffix += 1
+        used.add(candidate.casefold())
+        folders.append(selected / candidate)
+    return folders
+
+
+def reserved_workbook_folders(selected: Path) -> list[str]:
+    """Folder names already claimed under the selected folder by the running batch."""
+    selected_resolved = selected.resolve()
+    with _batch_lock:
+        raw_dirs = list(_status_output_dirs) if batch_is_running() else []
+    if not raw_dirs:
+        status = read_status()
+        if status.get("running"):
+            raw_dirs = [
+                part.strip()
+                for part in str(status.get("output_dir") or "").split(";")
+                if part.strip()
+            ]
+    names: list[str] = []
+    for raw in raw_dirs:
+        path = Path(raw)
+        try:
+            if path.resolve().parent == selected_resolved:
+                names.append(path.name)
+        except OSError:
+            continue
+    return names
 
 
 def video_filename(video_id: str) -> str:
@@ -213,164 +276,176 @@ def request_stop() -> None:
     _stop_requested.set()
 
 
+def enqueue_rows(
+    rows: list[ExcelVideoRow],
+    params: VideoParams,
+    skip_existing: bool = True,
+) -> None:
+    """Add spreadsheet rows to the running batch, starting it when idle."""
+    global _batch_thread, _status_current, _status_finished, _status_params, _status_skip_existing
+    if not rows:
+        raise ValueError("Add at least one spreadsheet row.")
+    with _batch_lock:
+        if _stop_requested.is_set() and batch_is_running():
+            raise RuntimeError(
+                "The current batch is stopping. Wait until it finishes, then add more spreadsheets."
+            )
+        already_running = batch_is_running()
+        if not already_running:
+            _queue.clear()
+            _status_items.clear()
+            _status_finished = 0
+            _status_output_dirs.clear()
+            _status_current = ""
+            _stop_requested.clear()
+            snapshot = params.model_copy(deep=True)
+            snapshot.video_script = ""
+            snapshot.video_count = 1
+            snapshot.custom_audio_file = None
+            _status_params = snapshot
+            _status_skip_existing = skip_existing
+        for row in rows:
+            if not row.output_dir:
+                raise ValueError(f"Video ID {row.video_id!r} has no output folder.")
+            _queue.append((len(_status_items), row))
+            _status_items.append(
+                {
+                    "source": row.source_name,
+                    "video_id": row.video_id,
+                    "status": "pending",
+                    "file": "",
+                    "error": "",
+                }
+            )
+            if row.output_dir not in _status_output_dirs:
+                _status_output_dirs.append(row.output_dir)
+        _publish_locked(
+            running=True,
+            current=_status_current if already_running else "",
+            message=f"Queued {len(rows)} video(s) from {len({row.source_name for row in rows})} spreadsheet(s).",
+        )
+        if not already_running:
+            _batch_thread = threading.Thread(
+                target=_run_queue,
+                name="excel-video-batch",
+                daemon=True,
+            )
+            _batch_thread.start()
+
+
 def start_batch(
     rows: list[ExcelVideoRow],
     output_dir: Path,
     params: VideoParams,
     skip_existing: bool = True,
 ) -> None:
-    """Generate the rows one at a time and save each file as its Video ID."""
-    global _batch_thread
-    with _batch_lock:
-        if batch_is_running():
-            raise RuntimeError("A spreadsheet batch is already running.")
-        _stop_requested.clear()
-        snapshot = params.model_copy(deep=True)
-        snapshot.video_script = ""
-        snapshot.video_count = 1
-        snapshot.custom_audio_file = None
-        _write_status(
-            {
-                "running": True,
-                "total": len(rows),
-                "finished": 0,
-                "current": "",
-                "output_dir": str(output_dir),
-                "message": "Waiting to start.",
-                "items": [
-                    {"video_id": row.video_id, "status": "pending", "file": "", "error": ""}
-                    for row in rows
-                ],
-            }
+    """Generate one spreadsheet, saving each video under its Video ID."""
+    queued = [
+        ExcelVideoRow(
+            video_id=row.video_id,
+            subject=row.subject,
+            search_terms=row.search_terms,
+            source_name=row.source_name,
+            output_dir=str(output_dir),
         )
-        _batch_thread = threading.Thread(
-            target=_run_batch,
-            args=(list(rows), output_dir, snapshot, skip_existing),
-            name="excel-video-batch",
-            daemon=True,
-        )
-        _batch_thread.start()
+        for row in rows
+    ]
+    enqueue_rows(queued, params, skip_existing=skip_existing)
 
 
-def _run_batch(
-    rows: list[ExcelVideoRow],
-    output_dir: Path,
-    params: VideoParams,
-    skip_existing: bool,
-) -> None:
-    status = read_status()
-    items = status.get("items", [])
-    finished = 0
-    try:
-        for index, row in enumerate(rows):
+def _run_queue() -> None:
+    while True:
+        with _batch_lock:
             if _stop_requested.is_set():
-                _mark_remaining(items, index, "stopped")
-                _write_status(
-                    {
-                        **status,
-                        "running": False,
-                        "finished": finished,
-                        "current": "",
-                        "message": "Stopped. Finished videos were kept.",
-                        "items": items,
-                    }
+                _mark_queued_stopped()
+                _publish_locked(
+                    running=False,
+                    current="",
+                    message="Stopped. Finished videos were kept.",
                 )
                 return
+            if not _queue:
+                _publish_locked(running=False, current="", message="Finished.")
+                return
+            index, row = _queue.popleft()
+            params = _status_params
+            skip_existing = _status_skip_existing
+            label = f"{row.source_name} / {row.video_id}" if row.source_name else row.video_id
+            _status_items[index]["status"] = "running"
+            _publish_locked(
+                running=True,
+                current=label,
+                message=f"Generating {label}.",
+            )
+        if params is None:
+            with _batch_lock:
+                _record_row(index, row, "failed", "", "Batch settings were missing.")
+            continue
+        destination = output_path(Path(row.output_dir), row.video_id)
+        if skip_existing and destination.is_file():
+            with _batch_lock:
+                _record_row(index, row, "skipped", str(destination), "")
+                _publish_locked(
+                    running=True,
+                    current="",
+                    message=f"Skipped {label} because the file already exists.",
+                )
+            continue
+        try:
+            saved = _generate_and_save(row, destination, params)
+        except Exception as exc:
+            logger.exception(f"excel batch row failed: video_id={row.video_id}")
+            with _batch_lock:
+                _record_row(index, row, "failed", "", str(exc))
+                _publish_locked(
+                    running=True,
+                    current="",
+                    message=f"{label} failed. Continuing with the next row.",
+                )
+            continue
+        with _batch_lock:
+            _record_row(index, row, "saved", str(saved), "")
+            _publish_locked(
+                running=True,
+                current="",
+                message=f"Saved {saved.name}.",
+            )
 
-            destination = output_path(output_dir, row.video_id)
-            if skip_existing and destination.is_file():
-                items[index] = {
-                    "video_id": row.video_id,
-                    "status": "skipped",
-                    "file": str(destination),
-                    "error": "",
-                }
-                finished += 1
-                status = {
-                    **status,
-                    "running": True,
-                    "finished": finished,
-                    "current": "",
-                    "message": f"Skipped {row.video_id} because the file already exists.",
-                    "items": items,
-                }
-                _write_status(status)
-                continue
 
-            status = {
-                **status,
-                "running": True,
-                "finished": finished,
-                "current": row.video_id,
-                "message": f"Generating {row.video_id}.",
-                "items": items,
-            }
-            _write_status(status)
-            items[index] = {
-                "video_id": row.video_id,
-                "status": "running",
-                "file": "",
-                "error": "",
-            }
-            try:
-                saved = _generate_and_save(row, destination, params)
-            except Exception as exc:
-                logger.exception(f"excel batch row failed: video_id={row.video_id}")
-                items[index] = {
-                    "video_id": row.video_id,
-                    "status": "failed",
-                    "file": "",
-                    "error": str(exc),
-                }
-                finished += 1
-                status = {
-                    **status,
-                    "finished": finished,
-                    "current": "",
-                    "message": f"{row.video_id} failed. Continuing with the next row.",
-                    "items": items,
-                }
-                _write_status(status)
-                continue
+def _record_row(index: int, row: ExcelVideoRow, status_name: str, file_path: str, error: str) -> None:
+    global _status_finished
+    _status_finished += 1
+    _status_items[index] = {
+        "source": row.source_name,
+        "video_id": row.video_id,
+        "status": status_name,
+        "file": file_path,
+        "error": error,
+    }
 
-            items[index] = {
-                "video_id": row.video_id,
-                "status": "saved",
-                "file": str(saved),
-                "error": "",
-            }
-            finished += 1
-            status = {
-                **status,
-                "finished": finished,
-                "current": "",
-                "message": f"Saved {saved.name}.",
-                "items": items,
-            }
-            _write_status(status)
 
-        _write_status(
-            {
-                **status,
-                "running": False,
-                "finished": finished,
-                "current": "",
-                "message": "Finished.",
-                "items": items,
-            }
-        )
-    except Exception as exc:
-        logger.exception(f"excel batch stopped unexpectedly: {exc}")
-        _write_status(
-            {
-                **status,
-                "running": False,
-                "finished": finished,
-                "current": "",
-                "message": f"Batch failed: {exc}",
-                "items": items,
-            }
-        )
+def _mark_queued_stopped() -> None:
+    pending = {index for index, _row in _queue}
+    _queue.clear()
+    for index in pending:
+        if _status_items[index].get("status") in {"pending", "running"}:
+            _status_items[index] = {**_status_items[index], "status": "stopped"}
+
+
+def _publish_locked(running: bool, current: str, message: str) -> None:
+    global _status_current
+    _status_current = current
+    _write_status(
+        {
+            "running": running,
+            "total": len(_status_items),
+            "finished": _status_finished,
+            "current": current,
+            "output_dir": "; ".join(_status_output_dirs),
+            "message": message,
+            "items": list(_status_items),
+        }
+    )
 
 
 def _generate_and_save(row: ExcelVideoRow, destination: Path, params: VideoParams) -> Path:
@@ -392,12 +467,6 @@ def _generate_and_save(row: ExcelVideoRow, destination: Path, params: VideoParam
     shutil.copy2(source, temporary)
     os.replace(temporary, destination)
     return destination
-
-
-def _mark_remaining(items: list[dict], start: int, status_name: str) -> None:
-    for index in range(start, len(items)):
-        if items[index].get("status") in {"pending", "running"}:
-            items[index] = {**items[index], "status": status_name}
 
 
 def _write_status(payload: dict) -> None:

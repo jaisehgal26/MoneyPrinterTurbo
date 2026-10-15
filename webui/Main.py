@@ -7999,15 +7999,17 @@ def _render_excel_batch(params):
     """Upload a spreadsheet and save one video per row, named by Video ID."""
     st.subheader("Generate from Excel")
     st.caption(
-        "Upload an .xlsx file with a Video ID column and a Subject column. "
+        "Upload one or more .xlsx files with a Video ID column and a Subject column. "
         "Each row becomes one video, using the voice, subtitles, and video source "
-        "selected on this page. Files are saved as the Video ID, for example MD-001.mp4."
+        "selected on this page. Files are saved as the Video ID, for example MD-001.mp4. "
+        "Several spreadsheets run in one batch, and more can be added while it is running."
     )
-    uploaded_sheet = st.file_uploader(
-        "Excel file",
+    uploaded_sheets = st.file_uploader(
+        "Excel files",
         type=["xlsx"],
+        accept_multiple_files=True,
         key="excel_batch_file",
-        help="The first worksheet must contain Video ID and Subject columns.",
+        help="Select one or more workbooks. Each needs Video ID and Subject columns.",
     )
     output_folder = _render_excel_folder_selector()
 
@@ -8016,47 +8018,85 @@ def _render_excel_batch(params):
         value=True,
         key="excel_batch_skip_existing",
     )
-    rows = []
-    if uploaded_sheet is not None:
-        try:
-            rows = excel_batch.parse_excel_rows(uploaded_sheet.getvalue())
-        except ValueError as exc:
-            st.error(str(exc))
-        else:
-            st.caption(f"{len(rows)} videos found.")
-            st.table(
-                [
-                    {
-                        "Video ID": row.video_id,
-                        "Subject": row.subject[:120],
-                        "Search terms": "; ".join(row.search_terms[:4]),
-                    }
-                    for row in rows[:8]
-                ]
-            )
-            if len(rows) > 8:
-                st.caption(f"Showing 8 of {len(rows)} rows.")
+    parsed = []
+    if uploaded_sheets:
+        for uploaded_sheet in uploaded_sheets:
+            try:
+                parsed.append(
+                    (
+                        uploaded_sheet.name,
+                        excel_batch.parse_excel_rows(uploaded_sheet.getvalue()),
+                    )
+                )
+            except ValueError as exc:
+                st.error(f"{uploaded_sheet.name}: {exc}")
+        if parsed:
+            video_count = sum(len(rows) for _, rows in parsed)
+            st.caption(f"{len(parsed)} spreadsheet(s), {video_count} videos.")
+            preview = []
+            for source_name, rows in parsed:
+                for row in rows:
+                    if len(preview) >= 8:
+                        break
+                    preview.append(
+                        {
+                            "File": source_name,
+                            "Video ID": row.video_id,
+                            "Subject": row.subject[:120],
+                        }
+                    )
+                if len(preview) >= 8:
+                    break
+            st.table(preview)
+            if video_count > len(preview):
+                st.caption(f"Showing {len(preview)} of {video_count} rows.")
+            if len(parsed) > 1 or excel_batch.batch_is_running():
+                st.caption(
+                    "Each spreadsheet is saved in its own folder inside the selected folder."
+                )
 
+    batch_running = excel_batch.batch_is_running()
     button_cols = st.columns(2)
     if button_cols[0].button(
-        "Generate videos from Excel",
+        "Add spreadsheets to the batch" if batch_running else "Generate videos from Excel",
         type="primary",
         use_container_width=True,
-        disabled=not rows or excel_batch.batch_is_running(),
+        disabled=not parsed,
         key="excel_batch_start",
     ):
         try:
             destination = excel_batch.resolve_output_dir(output_folder)
-            excel_batch.start_batch(
-                rows,
+            separate = len(parsed) > 1 or excel_batch.batch_is_running()
+            reserved = excel_batch.reserved_workbook_folders(destination) if separate else []
+            folders = excel_batch.workbook_output_dirs(
                 destination,
+                [source_name for source_name, _rows in parsed],
+                separate,
+                reserved,
+            )
+            queued = []
+            for (source_name, rows), folder in zip(parsed, folders):
+                for row in rows:
+                    queued.append(
+                        excel_batch.ExcelVideoRow(
+                            video_id=row.video_id,
+                            subject=row.subject,
+                            search_terms=row.search_terms,
+                            source_name=source_name,
+                            output_dir=str(folder),
+                        )
+                    )
+            excel_batch.enqueue_rows(
+                queued,
                 params,
                 skip_existing=skip_existing,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             st.error(str(exc))
         else:
-            st.success(f"Started {len(rows)} videos. Saving into {destination}.")
+            st.success(
+                f"Queued {len(queued)} videos from {len(parsed)} spreadsheet(s)."
+            )
     if button_cols[1].button(
         "Stop after current video",
         use_container_width=True,
@@ -8093,7 +8133,9 @@ def _render_excel_batch_status():
     if saved:
         st.caption(f"Saved {len(saved)} video(s) in {status.get('output_dir', '')}.")
     for item in failed[:5]:
-        st.error(f"{item.get('video_id')}: {item.get('error')}")
+        source = item.get("source")
+        label = f"{source}: {item.get('video_id')}" if source else item.get("video_id")
+        st.error(f"{label}: {item.get('error')}")
 
 
 def _render_generation_controls(

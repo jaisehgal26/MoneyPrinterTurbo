@@ -91,7 +91,27 @@ def test_video_id_rejects_path_characters():
         raise AssertionError("path-like video id was accepted")
 
 
-def test_folder_selector_stays_inside_allowed_roots(tmp_path, monkeypatch):
+def test_multiple_spreadsheets_get_separate_folders(tmp_path, monkeypatch):
+    folders = excel_batch.workbook_output_dirs(
+        tmp_path,
+        ["Plan.xlsx", "plan.xlsx", "Other.xlsx"],
+        separate=True,
+    )
+
+    assert folders == [
+        tmp_path / "Plan",
+        tmp_path / "plan-2",
+        tmp_path / "Other",
+    ]
+    assert excel_batch.workbook_output_dirs(tmp_path, ["Plan.xlsx"], separate=False) == [
+        tmp_path
+    ]
+    assert excel_batch.workbook_output_dirs(
+        tmp_path,
+        ["Plan.xlsx"],
+        separate=True,
+        reserved=["Plan"],
+    ) == [tmp_path / "Plan-2"]
     storage = tmp_path / "storage"
     home = tmp_path / "home"
     storage.mkdir()
